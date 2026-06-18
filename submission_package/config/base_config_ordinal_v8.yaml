@@ -1,0 +1,96 @@
+# AES 2.0 - Ordinal Regression Config V8 (Gemma 4 E4B)
+# V8 Upgrades from V6:
+#   Phase 1: Ordinal regression (5 cut points, BCE loss + pos_weight)
+#   Phase 2: Attention pooling (replaces last-token)
+#   Phase 2.5: 5-fold StratifiedKFold OOF
+#   Phase 5: A100 4×80GB optimization (BF16, FlashAttn-2, fused AdamW, torch.compile)
+
+model:
+  model_id: '/home/public/new_dl/gemma-4-E4B-it-local'
+  max_seq_length: 1536
+  load_in_4bit: false
+  use_unsloth: false
+
+lora:
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  bias: 'none'
+  target_modules:
+    - 'q_proj'
+    - 'k_proj'
+    - 'v_proj'
+    - 'o_proj'
+    - 'gate_proj'
+    - 'up_proj'
+    - 'down_proj'
+
+training:
+  output_dir: 'outputs/v8_kfold'
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 4
+  # effective_batch = 4 GPUs × 2 batch × 4 accum = 32
+  num_train_epochs: 2
+
+  warmup_ratio: 0.05
+  learning_rate: 1.0e-4
+  lr_scheduler_type: 'cosine'
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+  # Phase 5: A100 optimization
+  bf16: true
+  optim: 'adamw_torch_fused'
+  flash_attention_2: true
+  torch_compile: false
+
+  logging_steps: 10
+  eval_steps: 200
+  save_steps: 200
+  save_total_limit: 5
+  load_best_model_at_end: true
+  metric_for_best_model: 'qwk'
+  greater_is_better: true
+
+  dataloader_num_workers: 4
+  dataloader_pin_memory: true
+  gradient_checkpointing: true
+  ddp_find_unused_parameters: true
+
+  # ── V8: Two-Stage Training ──
+  stage1_epochs: 1                 # 0 = skip Stage 1
+  stage1_lr: 5.0e-4                # Stage 1: high lr, head + pooler only
+  stage2_head_lr_factor: 0.1       # Stage 2: head/pooler lr = base_lr × factor
+  use_oversampling: true           # sqrt-balance over-sample rare scores
+
+# ── V8: Ordinal Loss Configuration ──
+loss:
+  type: 'bce_ordinal'              # 'bce_ordinal' (replaces V6 huber/mse)
+  use_weighted_loss: true          # per-sample inverse-frequency weighting
+  # pos_weight is computed dynamically from training data distribution
+
+data:
+  train_path: 'data/processed/train_sft_nocot.jsonl'
+  val_path: 'data/processed/val_sft_nocot.jsonl'
+  head_ratio: 0.70
+  tail_ratio: 0.30
+  val_ratio: 0.1
+  use_few_shot: true
+  num_few_shot: 3
+  few_shot_path: 'data/few_shot_examples.json'
+
+inference:
+  batch_size: 8
+  max_new_tokens: 16
+  temperature: 0.1
+  do_sample: false
+
+monitoring:
+  use_wandb: false
+  wandb_project: 'aes2-gemma-e4b'
+  wandb_run_name: 'ordinal-v8'
+
+paths:
+  output_dir: 'outputs/v8_kfold'
+  results_dir: 'results'
