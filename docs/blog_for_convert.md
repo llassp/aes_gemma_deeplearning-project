@@ -1,0 +1,381 @@
+﻿# 我永远不会原谅单折 QWK  --作文自动评分模型设计
+
+---
+
+## 一、任务与约束：为什么选 Gemma 4 E4B + LoRA
+
+Kaggle [AES 2.0](https://www.kaggle.com/competitions/learning-agency-lab-automated-essay-scoring-2) 要求对 6-12 年级学生的英语作文进行自动评分，分数范围 **1~6 分**（1 分最差，6 分最优）。评估指标为 **Quadratic Weighted Kappa (QWK)**，衡量预测分数与真实分数之间的一致性，对偏离程度施加平方惩罚。QWK = 1.0 表示完美一致，0 表示随机一致。
+
+这个任务看似简单，实则暗藏三个核心挑战：
+
+1. **分数分布极度不均衡**：5-6 分仅占约 6.5%，而 2-4 分占了近 86%。这种不均衡是后面所有问题的根源——模型天然倾向于"猜均值"来降低整体损失。
+2. **长文本处理**：部分作文超过 1536 tokens，需要有效的池化策略。
+3. **分数间存在天然序数关系**：1→2→3→4→5→6，这是一个有序的_classification_任务，而非连续回归。
+
+**模型选择**：我们选用 Google 最新的 开源大模型Gemma 4 E4B（约 40 亿参数）作为 backbone，配合 **LoRA（Low-Rank Adaptation）** 微调。选择理由很实际——在  A100 40GB 上，BF16 精度下 LoRA 可将可训练参数压缩到约 53.7M（仅占总参数的 0.68%），显存和成本都可控。LoRA 配置为 `r=16, alpha=32, dropout=0.05`，覆盖全部线性层（q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj）。
+
+---
+在最开始，我构想了一个cot思维连生成+sft微调+后训练dpo偏好对齐的方法。
+但在实际操作中，cot首先被我放弃，因为要求一个4b参数的大模型同时推理出打分过程，实际上是在要求其将为数不多的注意力转移到学习语言格式上，这无疑是对有限资源的一种浪费。实际结果也不出所料，模型在重负之下选择了随机打分，最终呈现预测概率等同于随机数。
+接着，我又认识到了sft微调的不科学性，既然我们的目标只是输出分数，为什么要逐个token的生成”<score>X</score> 标签文本“，这样不仅分散模型注意力，而且降低推理速度。最终的结果也证明了这一点，在单折的训练结果下才得到了0.6左右的qwk值，且大部分预测集中于3-4分，可以认为模型并未学会深层作文逻辑，而只是识别了总体分数的分布。
+放弃了sft，dpo的偏好对齐自然也就失去了价值。
+
+## 二、V6 Baseline：一个"看似合理"的方案
+因此，经过小范围的论文查证与小批量测试。
+我们的初始方案（V6，是的是v6而不是v1😂）架构简洁明了：
+
+```
+Gemma 4 E4B (frozen + LoRA)
+    ↓
+Last-Token Pooling  (取最后一个非 padding token 的 hidden state)
+    ↓
+Linear(4096 → 1)    (回归头，输出连续分数)
+    ↓
+Huber Loss          (delta=1.0)
+```
+
+设计逻辑完全合理：
+- **Last-Token Pooling**：取序列最后一个 token 的表示，因为模型被 prompt 引导在末尾输出分数。
+- **回归头**：将 hidden state 映射到 1 维连续值。
+- **Huber Loss**：比 MSE 更抗异常值，训练初期 loss 下降平稳，数据十分好看。
+
+单折训练结果看起来非常漂亮——**验证集 QWK = 0.8101**。一切似乎都在正轨上。
+甚至在经过阈值优化的推理实验中，**QWK达到； 0.8254**。
+
+但这里有一个欺骗性极强的问题：这个"验证集"其实跟训练集同源（同一个 fold 内划分），评估结果天然偏高。反过来说，它完全没有暴露模型在"从未见过"的样本上的真实能力。
+
+---
+
+## 三、转折点：当 OOF 揭示真相
+怀着兴奋的心情， 我尝试了7小时的五折交叉训练。
+5-Fold 交叉训练完成后，Out-Of-Fold (OOF) 预测结果出来了：
+
+| 指标 | 单折 Eval QWK | **5-Fold OOF QWK** |
+|------|-------------|-------------------|
+| V6 Baseline | **0.8101** | **0.23** 😱 |
+
+**0.81 → 0.23，落差高达 0.58。**
+
+这就是本文的核心观点。一个在验证集上表现优异的模型，在面对从未训练过的样本时几乎完全失效。
+
+**什么是 OOF？** 在 5-Fold 交叉训练中，每个 fold 的验证集样本在该 fold 的训练过程中**从未被模型见过**。因此 OOF 预测是对模型泛化能力的无偏估计，远比单折 eval 可信。
+
+OOF 预测分数分布揭示了大模型幽默的真相：
+
+```
+Exp 2 (Huber + Attn Pooling) OOF 预测分布：
+  所有 17,307 篇作文的预测值
+  min=3.34, max=3.68, std=0.05
+  模型不认识 → 猜 3.5 分
+```
+
+**所有作文的预测分数都坍缩到了 3.5 分左右**——这正是数据集的平均分。模型学会了最"理性"的策略：不管输入什么作文，统一输出均值。
+
+![oof_collapse_hist](D:\aigc\dl_work\1\期末汇报大作业\oof_collapse_hist.png)
+
+---
+
+## 四、根因剖析：回归损失的数学陷阱
+
+为什么 Huber/MSE 回归会导致这种坍缩？这要从损失函数的数学性质说起。
+
+**MSE/Huber 的最优解是条件期望（conditional mean）**。对于任何一个模型不确定的样本，输出其条件期望能最小化期望损失。在分数分布极度不均衡的情况下（2-4 分占 86%），全局均值 ≈ 3.5 就是每个样本的条件期望的最佳近似。
+
+换句话说，**模型输出 3.5 分不是"笨"，而是"太理性了"，同时也太喜欢”偷懒“了**——在 Huber 损失的框架下，这是数学上的最优策略。
+
+我们可以用一张图直观理解：
+
+```
+真实分数分布：
+  1分: ████░░░░░░  7.2%
+  2分: ██████████░░ 27.3%
+  3分: ██████████████ 36.3%  ← 峰值
+  4分: █████████░░░░░ 22.7%
+  5分: ██░░░░░░░░░░  5.6%
+  6分: ░░░░░░░░░░░░  0.9%
+
+Huber 回归的"最优"策略：
+  所有样本 → 输出 3.5
+  期望损失最小，但 QWK 接近 0
+```
+
+![collapse_chart](D:\aigc\dl_work\1\期末汇报大作业\collapse_chart.png)
+
+这个发现解释了为什么 V6 Baseline 的单折 eval 如此乐观——训练集内部的分隔不足以暴露这个问题，因为模型记住了训练数据的模式。而 OOF 测试的是真正的泛化能力，Huber 回归的弱点无处遁形。
+
+---
+
+## 五、解法：序数回归（Ordinal Regression）
+
+在多次尝试优化连续回归无功而返后，我们转向**序数回归**——这种处理有序分类任务的标准方法。
+
+### 5.1 核心思想
+
+将 1-6 分的问题转化为 **5 个独立的二分类切点问题**：
+
+```
+切点 t1=1.5:  P(score ≥ 2) = sigmoid(z1)
+切点 t2=2.5:  P(score ≥ 3) = sigmoid(z2)
+切点 t3=3.5:  P(score ≥ 4) = sigmoid(z3)
+切点 t4=4.5:  P(score ≥ 5) = sigmoid(z4)
+切点 t5=5.5:  P(score ≥ 6) = sigmoid(z5)
+```
+
+对于一篇真实得分为 4 的作文，其标签转换为：
+```
+[1, 1, 1, 0, 0]  ← 前3个切点为正例，后2个为负例
+```
+
+这种设计巧妙地利用了分数的序数性质：如果模型预测 score ≥ 4 的概率高，那么 score ≥ 3 的概率也应该高。
+
+![ordinal_labels.png](D:\aigc\dl_work\1\期末汇报大作业\ordinal_labels.png)
+
+### 5.2 为什么"猜均值"行不通了？
+
+在 Huber 回归中，模型可以安全地输出 3.5 来最小化损失。但在序数回归框架下：
+
+- 如果模型对所有样本输出相同的 5-dim logits，那么所有切点的概率都是 0.5。
+- 对于 1 分作文（标签 [0,0,0,0,0]），BCE loss 会非常大。
+- 对于 6 分作文（标签 [1,1,1,1,1]），BCE loss 同样很大。
+是的，我们不是向huber loss一样回避loss 的出现，而是接受大loss，并且将其作为优化的通路。
+我们相信：**真金不怕火炼，优秀的模型总能从沟壑中走出康庄大道。**
+
+- **模型被迫学习区分不同分数段的特征**，无法再"偷懒"。
+
+### 5.3 处理切点级别的类别不均衡
+
+5 个切点各自面临不同程度的类别不均衡。例如 t5（判断是否 6 分）的正样本极少。我们使用 **BCEWithLogitsLoss + pos_weight** 来处理：
+
+```python
+# 按切点统计正样本比例，计算逆频率权重
+pos_weight = (neg_count / pos_count).float()
+loss = BCEWithLogitsLoss(pos_weight=pos_weight)(logits, targets)
+```
+
+---
+
+## 六、配套改进：Attention Pooling
+
+### 6.1 Last-Token 的问题
+
+V6 使用的 Last-Token Pooling 只取序列最后一个 token 的 hidden state，丢弃了中间所有 token 的信息。对于长作文来说，这意味着大量有用的语义信息被浪费了。
+
+### 6.2 可学习的注意力加权
+
+我们引入了 **Attention Pooling** 模块：
+
+```python
+class AttentionPooling(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.query = nn.Linear(hidden_size, hidden_size)
+        self.key = nn.Linear(hidden_size, hidden_size)
+        self.value = nn.Linear(hidden_size, hidden_size)
+        
+    def forward(self, hidden_states, attention_mask):
+        # 可学习的加权平均，权重由 attention_mask 控制
+        attn_weights = softmax(query @ key.T / sqrt(d))
+        return attn_weights @ value
+```
+
+### 6.3 零初始化的巧妙之处
+
+Attention Pooling 的一个关键技巧是**将 attention weights 初始化为零**：
+
+```python
+# 零初始化保证训练起步时 pooling 退化为恒等映射
+nn.init.zeros_(attn_weights)
+```
+
+**为什么这样做？** 如果随机初始化 attention weights，模型在训练初期可能产生极大的梯度波动，导致训练不稳定。零初始化确保：
+- 训练开始时，pooling 行为等价于取平均（或 last-token），与 V6 Baseline 一致。
+- 随着训练进行，attention weights 逐渐学习，不会破坏已经稳定的训练动态。
+
+这是一种"锦上再加花"的策略——不破坏 baseline 的稳定性，同时提供进一步提升的空间。
+
+![attention_pooling.png](D:\aigc\dl_work\1\期末汇报大作业\attention_pooling.png)
+
+---
+
+## 七、消融实验：用数据说话
+
+我们设计了完整的消融实验矩阵，逐一验证每个组件的贡献：
+
+| 实验编号 | 名称 | Pooling | Loss Head | 单折 QWK | **OOF QWK** |
+|---------|------|---------|-----------|---------|------------|
+| Exp 0 | V6 Baseline | Last-Token | Huber (dim=1) | ~0.81 | **~0.23** |
+| Exp 1 | **V8-Full** | Attention | Ordinal BCE (dim=5) | 0.836 | **0.835** ✅ |
+| Exp 2 | w/o Ordinal | Attention | Huber (dim=1) | **0.846** | **0.024** ❌ |
+| Exp 3 | w/o Attention | Last-Token | Ordinal BCE (dim=5) | 0.831 | **0.249** ⚠️ |
+
+![v6_vs_v8.png](D:\aigc\dl_work\1\期末汇报大作业\v6_vs_v8.png)
+
+### 三大核心发现
+
+![ablation_chart](D:\aigc\dl_work\1\期末汇报大作业\ablation_chart.png)
+
+**发现 1：单折 eval 完全骗人**
+
+Exp 2（Huber + Attention Pooling）在单折 eval 上达到了 **0.846**（所有实验中最好），但 OOF 只有 **0.024**（所有实验中最差）。这说明了什么？
+
+> **验证集评估 ≠ 模型泛化能力**。Huber + Attn Pooling 在训练集上过拟合到了极致——attention 机制赋予了模型更强的记忆能力，反而加剧了对训练模式的死记硬背。面对未见过的作文，模型只会输出全局均值。
+
+**发现 2：序数回归是唯一解**
+
+- V8-Full（Ordinal + Attn）的 OOF std = **1.06**，完整覆盖了 1-6 分的区间。
+- Exp 2（Huber + Attn）的 OOF std = **0.05**，全部坍缩到 3.5 附近。
+- 5 个独立二分类迫使模型对每个切点做出判断，**无法再用"猜均值"逃避**。
+
+![qwk_convergence.png](D:\aigc\dl_work\1\期末汇报大作业\qwk_convergence.png)
+
+**发现 3：Attention Pooling 锦上再上添花**
+
+在序数回归的基础上，Attention Pooling 带来了 **+0.004** 的 OOF 提升（Exp 3: 0.831 → V8-Full: 0.835）。虽然幅度不大，但考虑到：
+- 实验在 5-Fold 交叉验证上进行，统计噪声已被大幅稀释
+- 零初始化的 Attn Pooling 没有引入训练不稳定性
+- 这是一个"免费"的提升
+
+值得保留。
+
+---
+
+## 八、后处理：5-Fold OOF + 阈值优化
+
+### 8.1 从连续分数到离散评分
+
+序数回归输出 5 个切点的 logits，通过 sigmoid 求和得到连续分数：
+
+```python
+continuous_score = sum(sigmoid(z_i) for z_i in logits)
+discrete_score = digitize(continuous_score, thresholds) + 1
+```
+
+### 8.2 两步阈值优化
+
+固定阈值 [1.5, 2.5, 3.5, 4.5, 5.5] 并非最优。我们采用两步策略：
+
+1. **Nelder-Mead 优化**：在连续分数空间中进行无梯度优化，找到使 OOF QWK 最大的阈值组合。
+2. **暴力搜索 5→6 边界**：固定前 4 个阈值，在 [3.8, 5.0] 范围内以 0.01 为步长扫描第 5 个阈值。
+
+最终优化得到的阈值为：
+
+```
+[1.63, 2.57, 3.59, 4.77, 5.40]
+```
+
+与固定阈值的差异虽小，但在 QWK 这种对边界敏感的指标上，每一分都来之不易。
+
+---
+
+## 九、工程踩坑清单
+
+在实际训练中，我们遇到了不少坑。如果你也在用 Gemma4 + PEFT，以下经验可以直接复用：
+
+### 9.1 Gemma4 PEFT 保存 Bug
+
+Gemma4 使用了自定义的 `ClippableLinear` 层，不暴露标准的 `.weight` 属性。这导致 PEFT 在保存 adapter 时失败。
+
+**解决方案**：通过 monkey patch 动态添加 `.weight` property：
+
+```python
+def patch_gemma4_clippable_layers(model):
+    for module in model.named_modules():
+        if "ClippableLinear" in module.__class__.__name__:
+            cls = module.__class__
+            @property
+            def weight_property(self):
+                for name, param in self.named_parameters():
+                    if "weight" in name:
+                        return param
+            cls.weight = weight_property
+```
+
+### 9.2 DDP 下 `model.peft_config` 不可访问
+
+使用 `torchrun` 启动 DDP 后，模型被包裹在 `DistributedDataParallel` 中，`model.peft_config` 变为 `model.module.peft_config`。保存时需要：
+
+```python
+if hasattr(model, "module"):
+    model.module.save_pretrained(output_dir)
+else:
+    model.save_pretrained(output_dir)
+```
+
+### 9.3 `pos_weight` 设备同步
+
+`pos_weight` tensor 如果在 CPU 上创建，需要在 forward 时迁移到正确设备：
+
+```python
+pos_weight = pos_weight.to(logits.device)
+```
+
+否则会在反向传播时引发 device mismatch 错误。
+
+### 9.4 两阶段训练的 OOM
+
+Stage 2 联合训练时，由于 attention pooling + ordinal head 增加了参数量，batch size 需要从 4 降到 2，否则 A100 40GB 显存不够用。
+
+---
+
+
+---
+
+## 智能体（Claude Code）使用记录
+
+本次任务的代码由 Claude Code 在人工监督下生成和调试。以下是关键使用记录：
+
+### 从 V6 到 V8 的一次 Prompt 迁移
+
+V6 Baseline 升级到 V8 Full Pipeline 的架构设计，通过一个claude.md完成：
+
+Claude Code 自动完成了：
+- 序数回归头的设计（5-dim logits + BCEWithLogitsLoss + pos_weight）
+- Attention Pooling 模块（零初始化 + 加权平均）
+- 5-Fold StratifiedKFold 划分脚本
+- OOF 推理 + 阈值优化 pipeline
+- torchrun DDP 多卡训练适配
+
+### 迭代调试
+
+整个开发过程迭代了约 **10 轮**，主要修复：
+- Gemma4 `ClippableLinear` 层导致 PEFT 保存失败（monkey patch 修复）
+- DDP 下 `model.peft_config` 路径错误
+- `pos_weight` CPU/GPU 设备不匹配
+- FlashAttention-2 + BF16 兼容性问题
+- 两阶段训练 OOM（batch size 从 4→2）
+
+
+## 十、总结
+
+### 最终结果
+
+| 指标 | 数值 |
+|------|------|
+| **OOF QWK** | **0.8354** |
+| 优化阈值 | [1.63, 2.57, 3.59, 4.77, 5.40] |
+| 训练耗时 | ~7.5h（4 fold ） |
+| 硬件成本 | A100 40GB × ~20h |
+
+### 核心教训
+
+1. **损失函数选择对序数标签至关重要**：Huber/MSE 回归在分数分布不均衡时会不可避免地坍缩到均值，序数回归是评分类任务的标配方案。
+2. **0.846是你的谎言**：Exp 2 单折 0.846 vs OOF 0.024 是最深刻的教训——验证集上的"好结果"可能是过拟合的假象。
+3. **OOF 是唯一可信赖的评估方式**：在 Kaggle 竞赛中，Public LB 同样可能存在泄漏，OOF 交叉验证才是检验模型泛化能力的金标准。
+4. **Attention Pooling + 零初始化是一个稳健的 trick**：不破坏训练稳定性，同时提供边际提升。
+
+### 后续方向
+
+- **集成多个 fold 的模型**：5 个 fold 的 ensemble 可能进一步降低方差。
+- **探索更多数据增强策略**：当前仅使用了 oversampling，可以尝试 mixup 或对抗训练。
+- **尝试更大的 backbone** 实际上gemma是一个多模态的模型，我们需要关闭多模态开关使用，如果采用纯文本模型，比如deepseekv4, 可能在长作文理解上有优势。
+
+---
+
+## 参考文献
+
+1. Kaggle AES 2.0 Competition: https://www.kaggle.com/competitions/learning-agency-lab-automated-essay-scoring-2
+2. Google Gemma: https://ai.google.dev/gemma
+3. Hu et al. "LoRA: Low-Rank Adaptation of Large Language Models", ICLR 2022
+4. Frank & Hall "A Simple Approach to Ordinal Classification", ECML 2001
+5. Dao et al. "FlashAttention-2: Faster Attention with Better Parallelism", 2023
+
